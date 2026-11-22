@@ -343,6 +343,48 @@ def _filter_column_dict(
     return {key: dictionary[key] for key in dictionary if key in columns}
 
 
+@beartype
+def _get_unused_column_name(X: DataFrame, wanted_name: str) -> str:
+    """Get wanted_name, or a suffixed variant of it not already present in X.
+
+    Used to create temporary helper columns without clashing with user data.
+
+    Parameters
+    ----------
+    X:
+        dataframe the column will be added to
+
+    wanted_name:
+        preferred column name
+
+    Returns
+    -------
+    str: unused column name
+
+    Examples
+    --------
+    ```pycon
+    >>> import polars as pl
+    >>> df = pl.DataFrame({"a": [1], "__tmp__": [2]})
+    >>> _get_unused_column_name(df, "__tmp__")
+    '__tmp___1'
+    >>> _get_unused_column_name(df, "__other__")
+    '__other__'
+
+    ```
+
+    """
+    existing_columns = X.collect_schema().names()
+
+    column_name = wanted_name
+    suffix = 1
+    while column_name in existing_columns:
+        column_name = f"{wanted_name}_{suffix}"
+        suffix += 1
+
+    return column_name
+
+
 def _null_safe_string_cast(input_expr: nw.Expr, handle_nans: bool = False) -> nw.Expr:
     """Cast column to string without corrupting null values.
 

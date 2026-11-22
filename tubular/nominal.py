@@ -7,6 +7,8 @@ from typing import Any, Literal
 
 import narwhals as nw
 from beartype import beartype
+from sklearn.base import clone
+from sklearn.model_selection import GroupKFold
 
 from tubular._stats import (
     _get_mean_calculation_expressions,
@@ -17,11 +19,13 @@ from tubular._utils import (
     _collect_series,
     _convert_dataframe_to_narwhals,
     _convert_series_to_narwhals,
+    _get_unused_column_name,
     _is_null,
     _return_narwhals_or_native_dataframe,
     _sort_dict,
     _sort_nested_dict,
     block_from_json,
+    new_narwhals_series_with_optimal_pandas_types,
 )
 from tubular.base import BaseTransformer, register
 from tubular.functions.nominal import (
@@ -39,6 +43,7 @@ from tubular.types import (
     ListOfStrs,
     PositiveInt,
     Series,
+    StrictlyPositiveInt,
 )
 
 
@@ -570,6 +575,19 @@ class MeanResponseTransformer(
     return_type: Literal['float32', 'float64']
         What type to cast return column as. Defaults to float32.
 
+    group_column : str or None, default = None
+        Column identifying the group (e.g. device) each row belongs to. If provided, the
+        ``fit_transform`` method (the entry point used by ``sklearn.pipeline.Pipeline.fit``)
+        produces out-of-fold encodings: every training row is encoded using mappings learnt
+        from the rows in other folds only, with whole groups held out together. Mappings
+        learnt by ``fit`` (and used by ``transform``, e.g. on new data) are always fitted on
+        the full data, so a fitted pipeline applies full-data mappings to new tables. If
+        None, ``fit_transform`` simply fits on the full data and transforms it.
+
+    n_splits : int, default = 5
+        Number of group folds used by ``fit_transform`` when ``group_column`` is provided.
+        Capped at the number of distinct groups present in the data. Must be at least 2.
+
     built_from_json: bool
         indicates if transformer was reconstructed from json, which limits it's supported
         functionality to .transform
@@ -607,7 +625,7 @@ class MeanResponseTransformer(
 
     >>> json_dump = transformer.to_json()
     >>> json_dump
-    {'tubular_version': ..., 'classname': 'MeanResponseTransformer', 'init': {'columns': ['a'], 'copy': False, 'verbose': False, 'return_native': True, 'weights_column': None, 'prior': 1, 'level': None, 'unseen_level_handling': 'mean', 'return_type': 'Float32'}, 'fit': {'is_fitted_': True, 'mappings': {'a': {'x': 0.25, 'y': 0.75}}, 'return_dtypes': {'a': 'Float32'}, 'column_to_encoded_columns': {'a': ['a']}, 'encoded_columns': ['a'], 'unseen_levels_encoding_dict': {'a': 0.5}}}
+    {'tubular_version': ..., 'classname': 'MeanResponseTransformer', 'init': {'columns': ['a'], 'copy': False, 'verbose': False, 'return_native': True, 'weights_column': None, 'prior': 1, 'level': None, 'unseen_level_handling': 'mean', 'return_type': 'Float32', 'group_column': None, 'n_splits': 5}, 'fit': {'is_fitted_': True, 'mappings': {'a': {'x': 0.25, 'y': 0.75}}, 'return_dtypes': {'a': 'Float32'}, 'column_to_encoded_columns': {'a': ['a']}, 'encoded_columns': ['a'], 'unseen_levels_encoding_dict': {'a': 0.5}}}
     >>> MeanResponseTransformer.from_json(json_dump)
     MeanResponseTransformer(columns=['a'], prior=1, unseen_level_handling='mean')
 
@@ -635,6 +653,8 @@ class MeanResponseTransformer(
         | Literal["mean", "median", "min", "max"]
         | None = None,
         return_type: Literal["Float32", "Float64"] = "Float32",
+        group_column: str | None = None,
+        n_splits: StrictlyPositiveInt = 5,
         **kwargs: bool,
     ) -> None:
         """Initialise class instance.
@@ -667,8 +687,24 @@ class MeanResponseTransformer(
         return_type: Literal['float32', 'float64']
             What type to cast return column as, consider exploring float32 to save memory. Defaults to float32.
 
+        group_column : str or None, default = None
+            Column identifying the group (e.g. device) each row belongs to. If provided,
+            ``fit_transform`` produces out-of-fold encodings with whole groups held out
+            together (used by sklearn as the training entry point for intermediate
+            pipeline steps), while the mappings stored by ``fit`` (and applied by
+            ``transform``) are fitted on the full data.
+
+        n_splits : int, default = 5
+            Number of group folds used by ``fit_transform`` when ``group_column`` is provided.
+            Capped at the number of distinct groups present. Must be at least 2.
+
         **kwargs
             Arbitrary keyword arguments passed onto BaseTransformer.init method.
+
+        Raises
+        ------
+        ValueError
+            If ``n_splits`` is less than 2.
 
         """
         self.weights_column = weights_column
@@ -676,6 +712,12 @@ class MeanResponseTransformer(
         self.prior = prior
         self.unseen_level_handling = unseen_level_handling
         self.return_type = return_type
+        self.group_column = group_column
+        self.n_splits = n_splits
+
+        if n_splits < 2:  # noqa: PLR2004
+            msg = f"{self.classname()}: n_splits must be at least 2, got {n_splits}"
+            raise ValueError(msg)
 
         self.MULTI_LEVEL = False
 
@@ -713,7 +755,7 @@ class MeanResponseTransformer(
         >>> _ = transformer.fit(test_df[["a"]], test_df["b"])
 
         >>> transformer.to_json()
-        {'tubular_version': ..., 'classname': 'MeanResponseTransformer', 'init': {'columns': ['a'], 'copy': False, 'verbose': False, 'return_native': True, 'weights_column': None, 'prior': 0, 'level': None, 'unseen_level_handling': None, 'return_type': 'Float32'}, 'fit': {'is_fitted_': True, 'mappings': {'a': {'x': 0.0, 'y': 1.0}}, 'return_dtypes': {'a': 'Float32'}, 'column_to_encoded_columns': {'a': ['a']}, 'encoded_columns': ['a']}}
+        {'tubular_version': ..., 'classname': 'MeanResponseTransformer', 'init': {'columns': ['a'], 'copy': False, 'verbose': False, 'return_native': True, 'weights_column': None, 'prior': 0, 'level': None, 'unseen_level_handling': None, 'return_type': 'Float32', 'group_column': None, 'n_splits': 5}, 'fit': {'is_fitted_': True, 'mappings': {'a': {'x': 0.0, 'y': 1.0}}, 'return_dtypes': {'a': 'Float32'}, 'column_to_encoded_columns': {'a': ['a']}, 'encoded_columns': ['a']}}
 
         ```
 
@@ -736,6 +778,8 @@ class MeanResponseTransformer(
                 "level": self.level,
                 "unseen_level_handling": self.unseen_level_handling,
                 "return_type": self.return_type,
+                "group_column": self.group_column,
+                "n_splits": self.n_splits,
             },
         )
 
@@ -913,14 +957,23 @@ class MeanResponseTransformer(
         ValueError: if user provided levels are not present in y
 
         """
-        self.response_levels = self.level
+        # when fitting the per-fold transformers used for out-of-fold encoding,
+        # response levels are pinned to those found in the full data, so every fold
+        # produces the same set of encoded columns
+        pinned_response_levels = getattr(self, "_pinned_response_levels", None)
 
-        if self.level == "all":
+        if pinned_response_levels is not None:
+            self.response_levels = list(pinned_response_levels)
+
+        elif self.level == "all":
             self.response_levels = y_vals
 
-        elif any(level not in y_vals for level in self.level):
-            msg = "Levels contains a level to encode against that is not present in the response."
-            raise ValueError(msg)
+        else:
+            self.response_levels = self.level
+
+            if any(level not in y_vals for level in self.response_levels):
+                msg = "Levels contains a level to encode against that is not present in the response."
+                raise ValueError(msg)
 
         self.column_to_encoded_columns = {
             c: [c + "_" + str(level) for level in self.response_levels]
@@ -1200,6 +1253,240 @@ class MeanResponseTransformer(
         self.is_fitted_ = True
 
         return self
+
+    @beartype
+    def _get_group_fold_ids(self, groups: nw.Series) -> list[int]:
+        """Assign each row to a group fold, holding whole groups out together.
+
+        Parameters
+        ----------
+        groups : nw.Series
+            group value per row, in row order
+
+        Returns
+        -------
+        list[int]: fold id per row, in row order
+
+        Raises
+        ------
+        ValueError
+            If any group is null, or if fewer than two distinct groups are present.
+
+        """
+        # validate here rather than rely on GroupKFold, which needs groups to be sortable,
+        # and so chokes on e.g. strings mixed with nulls. Use the narwhals null mask so
+        # pandas NaN values are caught as well as None.
+        if (null_count := groups.is_null().sum()) > 0:
+            msg = f"{self.classname()}: group_column ({self.group_column}) contains null values ({null_count} nulls), groups must be non-null for out-of-fold encoding"
+            raise ValueError(msg)
+
+        group_values = groups.to_list()
+        distinct_groups = list(dict.fromkeys(group_values))
+
+        n_splits = min(self.n_splits, len(distinct_groups))
+        if n_splits < 2:  # noqa: PLR2004
+            msg = f"{self.classname()}: out-of-fold encoding requires at least 2 distinct groups in group_column ({self.group_column}), found {len(distinct_groups)}"
+            raise ValueError(msg)
+
+        # GroupKFold only needs the length of X, so pass a placeholder. shuffle is not
+        # passed as it is only available in newer sklearn versions than we support.
+        group_kfold = GroupKFold(n_splits=n_splits)
+
+        fold_ids = [0] * len(group_values)
+        for fold_id, (_, validation_indices) in enumerate(
+            group_kfold.split([[0]] * len(group_values), None, group_values)
+        ):
+            for row_index in validation_indices:
+                fold_ids[row_index] = fold_id
+
+        return fold_ids
+
+    @beartype
+    @block_from_json
+    def _fit_oof_fold_transformer(
+        self,
+        X: DataFrame,
+        y: nw.Series,
+        fit_mask: nw.Series,
+        pinned_response_levels: list[Any] | None,
+    ) -> MeanResponseTransformer:
+        """Fit a clone of this transformer on the rows outside a fold.
+
+        Parameters
+        ----------
+        X : DataFrame
+            Training data, including any group/row-index helper columns.
+
+        y : nw.Series
+            Response values aligned with X.
+
+        fit_mask : nw.Series
+            Boolean mask selecting the rows to fit on (those outside the fold).
+
+        pinned_response_levels : list or None
+            For multi-level encodings, response levels to encode against. These are pinned
+            from the full data so every fold produces the same encoded columns.
+
+        Returns
+        -------
+        MeanResponseTransformer: transformer fitted on the out-of-fold rows
+
+        """
+        fold_transformer = clone(self)
+        # treat fit as the plain per-fold fit, with no further nested
+        # out-of-fold recursion
+        fold_transformer.group_column = None
+        fold_transformer.return_native = False
+
+        if pinned_response_levels is not None:
+            fold_transformer.level = list(pinned_response_levels)
+            fold_transformer._pinned_response_levels = list(pinned_response_levels)
+
+        fold_transformer.fit(
+            X.filter(fit_mask),
+            y.filter(fit_mask),
+        )
+
+        return fold_transformer
+
+    @block_from_json
+    @beartype
+    def fit_transform(  # noqa: PLR0914, mimic sklearn signature and keep steps explicit
+        self,
+        X: DataFrame,
+        y: Series | LazyFrame,
+        **fit_params: Any,  # noqa: ANN401, ARG002, sklearn compatibility
+    ) -> DataFrame:
+        """Fit on the full data and return grouped out-of-fold encodings.
+
+        This is the training entry point used by ``sklearn.pipeline.Pipeline.fit`` for
+        intermediate steps. When ``group_column`` is set, the returned encodings are
+        out-of-fold: each training row is encoded using mappings learnt from the other
+        folds only, with all rows for a given group held out together. This prevents the
+        target leaking into a row's own encoding when a group (device) has multiple rows.
+
+        The mappings stored on ``self`` (and applied by ``transform``) are always fitted
+        on the full data, so the fitted pipeline can be applied to new tables using
+        full-data mappings. Column names and row order match ``transform`` on the same
+        data.
+
+        If ``group_column`` is None, ``fit`` is run on the full data and the input is
+        transformed with those mappings.
+
+        Parameters
+        ----------
+        X : DataFrame
+            Training data.
+
+        y : Series or LazyFrame
+            Response variable or target.
+
+        **fit_params
+            Ignored, present for sklearn API compatibility.
+
+        Returns
+        -------
+        DataFrame: out-of-fold encoded training data
+
+        Raises
+        ------
+        ValueError
+            If ``group_column`` is not present in ``X``, contains nulls, or has fewer
+            than two distinct groups.
+
+        Examples
+        --------
+        ```pycon
+        >>> import polars as pl
+
+        >>> df = pl.DataFrame(
+        ...     {
+        ...         "device": ["d1", "d1", "d2", "d2"],
+        ...         "part": ["a", "a", "a", "a"],
+        ...         "cost": [1.0, 1.0, 10.0, 10.0],
+        ...     }
+        ... )
+
+        >>> transformer = MeanResponseTransformer(
+        ...     columns="part", group_column="device", n_splits=2
+        ... )
+
+        >>> # each device is encoded using mappings from the other device only
+        >>> transformer.fit_transform(df, df["cost"]).to_dict(as_series=False)
+        {'device': ['d1', 'd1', 'd2', 'd2'], 'part': [10.0, 10.0, 1.0, 1.0], 'cost': [1.0, 1.0, 10.0, 10.0]}
+
+        >>> # transform, used for new data, applies the full-data mappings
+        >>> transformer.transform(df).to_dict(as_series=False)
+        {'device': ['d1', 'd1', 'd2', 'd2'], 'part': [5.5, 5.5, 5.5, 5.5], 'cost': [1.0, 1.0, 10.0, 10.0]}
+
+        ```
+
+        """
+        X = _convert_dataframe_to_narwhals(X)
+        y = _collect_series(_convert_series_to_narwhals(y))
+
+        if self.group_column is None:
+            return self.fit(X, y).transform(X)
+
+        X = _collect_frame(X)
+
+        if self.group_column not in X.collect_schema().names():
+            msg = f"{self.classname()}: group_column ({self.group_column}) is not present in columns of data"
+            raise ValueError(msg)
+
+        # group for each row, in row order
+        groups = X.get_column(self.group_column)
+        fold_ids = self._get_group_fold_ids(groups)
+
+        row_index_column = _get_unused_column_name(X, "__tubular_row_index__")
+        fold_column = _get_unused_column_name(X, "__tubular_fold__")
+
+        backend = nw.get_native_namespace(X).__name__
+        fold_ids_series = new_narwhals_series_with_optimal_pandas_types(
+            fold_column,
+            fold_ids,
+            backend=backend,
+            dtype=nw.Int32,
+        )
+
+        X_with_folds = X.with_row_index(row_index_column).with_columns(fold_ids_series)
+
+        # fit on the full data first, so the stored mappings (used by transform on new
+        # data) cover every row, and so the output column names are known
+        self.fit(X, y)
+
+        # columns produced by the full-data transform, used to align the fold encodings
+        output_columns = self.transform(X).columns
+
+        pinned_response_levels = (
+            list(self.response_levels) if self.MULTI_LEVEL else None
+        )
+
+        fold_outputs = []
+        for fold_id in range(len(set(fold_ids))):
+            fold_mask = X_with_folds.get_column(fold_column) == fold_id
+            # fit on the rows outside this fold, so held-out groups contribute nothing
+            fit_mask = X_with_folds.get_column(fold_column) != fold_id
+
+            fold_transformer = self._fit_oof_fold_transformer(
+                X_with_folds,
+                y,
+                fit_mask,
+                pinned_response_levels,
+            )
+
+            fold_outputs.append(
+                fold_transformer.transform(X_with_folds.filter(fold_mask)),
+            )
+
+        encoded = (
+            nw.concat(fold_outputs)
+            .sort(row_index_column)
+            .drop([row_index_column, fold_column])
+            .select(output_columns)
+        )
+
+        return _return_narwhals_or_native_dataframe(encoded, self.return_native)
 
     @beartype
     @block_from_json

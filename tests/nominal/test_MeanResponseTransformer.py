@@ -3,6 +3,7 @@ from itertools import product
 
 import narwhals as nw
 import numpy as np
+import pandas as pd
 import polars as pl
 import pytest
 from beartype.roar import BeartypeCallHintParamViolation
@@ -1594,3 +1595,365 @@ class TestLazyYSupport:
         transformer_eager.fit(df, df["a"])
 
         assert transformer_lazy.mappings == transformer_eager.mappings
+
+
+def create_grouped_test_df(library="polars"):
+    """Create a dataframe with several rows per device, for out-of-fold tests."""
+    df_dict = {
+        "device": ["d1", "d1", "d2", "d2", "d3", "d3", "d4", "d4"],
+        "part": ["a", "b", "a", "a", "b", "b", "a", "b"],
+        "cost": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+    }
+
+    return dataframe_init_dispatch(dataframe_dict=df_dict, library=library)
+
+
+def get_columns(df):
+    """Return column names for a pandas or polars dataframe."""
+    return list(df.columns)
+
+
+class TestInitGroupArguments:
+    """Tests for group_column/n_splits handling in MeanResponseTransformer.init()."""
+
+    def test_group_column_stored(self):
+        """Test that group_column is stored and defaults are set."""
+        transformer = MeanResponseTransformer(columns="part", group_column="device")
+
+        assert transformer.group_column == "device"
+        assert transformer.n_splits == 5  # noqa: PLR2004
+
+    def test_group_column_defaults_to_none(self):
+        """Test that group_column defaults to None."""
+        transformer = MeanResponseTransformer(columns="part")
+
+        assert transformer.group_column is None
+
+    @pytest.mark.parametrize("n_splits", [0, 1])
+    def test_n_splits_below_two_errors(self, n_splits):
+        """Test that n_splits below 2 raises an error."""
+        with pytest.raises(
+            (ValueError, BeartypeCallHintParamViolation),
+            match=r"n_splits must be at least 2|violates type hint",
+        ):
+            MeanResponseTransformer(
+                columns="part", group_column="device", n_splits=n_splits
+            )
+
+    def test_n_splits_serialised(self):
+        """Test that group_column and n_splits are included in json output."""
+        transformer = MeanResponseTransformer(
+            columns="part", group_column="device", n_splits=3
+        )
+        transformer.fit(create_grouped_test_df(), pl.Series("cost", [1.0] * 8))
+
+        json_dict = transformer.to_json()
+
+        assert json_dict["init"]["group_column"] == "device"
+        assert json_dict["init"]["n_splits"] == 3  # noqa: PLR2004
+        assert MeanResponseTransformer.from_json(json_dict).group_column == "device"
+
+
+class TestGroupedFitTransform:
+    """Tests for out-of-fold encoding in MeanResponseTransformer.fit_transform()."""
+
+    @pytest.mark.parametrize("library", ["pandas", "polars"])
+    def test_output_columns_and_row_order_match_transform(self, library):
+        """Test fit_transform produces the same columns and row order as transform."""
+        df = create_grouped_test_df(library=library)
+        y = df["cost"]
+
+        transformer = MeanResponseTransformer(
+            columns="part", group_column="device", n_splits=4
+        )
+
+        fit_transform_output = transformer.fit_transform(df, y)
+        transform_output = transformer.transform(df)
+
+        assert get_columns(fit_transform_output) == get_columns(transform_output)
+        assert len(fit_transform_output) == len(df)
+
+        # values line up row by row with the input after the row-order sort
+        assert (
+            nw.from_native(fit_transform_output).get_column("cost").to_list()
+            == nw.from_native(df).get_column("cost").to_list()
+        )
+
+    @pytest.mark.parametrize("library", ["pandas", "polars"])
+    def test_full_mappings_stored(self, library):
+        """Test fit_transform still stores mappings fitted on the full data."""
+        df = create_grouped_test_df(library=library)
+        y = df["cost"]
+
+        transformer = MeanResponseTransformer(
+            columns="part", group_column="device", n_splits=4
+        )
+        transformer.fit_transform(df, y)
+
+        full_fit = MeanResponseTransformer(columns="part").fit(df, y)
+
+        assert transformer.mappings == full_fit.mappings
+
+    @pytest.mark.parametrize("library", ["pandas", "polars"])
+    def test_held_out_groups_use_other_rows(self, library):
+        """Test that each row is encoded from rows in other groups only."""
+        df_dict = {
+            "device": ["d1", "d1", "d2", "d2"],
+            "part": ["a", "a", "a", "a"],
+            "cost": [1.0, 1.0, 10.0, 10.0],
+        }
+        df = dataframe_init_dispatch(dataframe_dict=df_dict, library=library)
+
+        transformer = MeanResponseTransformer(
+            columns="part", group_column="device", n_splits=2
+        )
+        output = transformer.fit_transform(df, df["cost"])
+
+        values = nw.from_native(output).get_column("part").to_list()
+
+        # d1 is encoded from d2 only (10.0) and d2 from d1 only (1.0)
+        assert values == [10.0, 10.0, 1.0, 1.0]
+
+    @pytest.mark.parametrize("library", ["pandas", "polars"])
+    def test_no_target_leakage_within_group(self, library):
+        """Test a row's own group is never used to encode it."""
+        df = create_grouped_test_df(library=library)
+
+        transformer = MeanResponseTransformer(
+            columns="part", group_column="device", n_splits=4
+        )
+        output = nw.from_native(transformer.fit_transform(df, df["cost"]))
+
+        full_mappings = (
+            MeanResponseTransformer(columns="part").fit(df, df["cost"]).mappings["part"]
+        )
+
+        # with single-row-per-group folds, the other folds cover the other devices, so
+        # encodings must differ from the full-data encodings
+        assert output.get_column("part").to_list() != [
+            full_mappings[value] for value in df["part"].to_list()
+        ]
+
+    @pytest.mark.parametrize("library", ["pandas", "polars"])
+    def test_multilevel_columns_match_transform(self, library):
+        """Test multi-level encodings keep the same columns under fit_transform."""
+        df_dict = {
+            "device": ["d1", "d1", "d2", "d2", "d3", "d3", "d4", "d4"],
+            "part": ["a", "b", "a", "a", "b", "b", "a", "b"],
+            "cost": ["lo", "hi", "lo", "lo", "hi", "hi", "lo", "hi"],
+        }
+        df = dataframe_init_dispatch(dataframe_dict=df_dict, library=library)
+
+        transformer = MeanResponseTransformer(
+            columns="part",
+            level="all",
+            unseen_level_handling="mean",
+            group_column="device",
+            n_splits=4,
+        )
+
+        output = transformer.fit_transform(df, df["cost"])
+        expected_columns = transformer.transform(df).columns
+
+        assert get_columns(output) == list(expected_columns)
+        assert len(output) == len(df)
+
+    @pytest.mark.parametrize("library", ["pandas", "polars"])
+    def test_multilevel_no_leakage(self, library):
+        """Test multi-level encodings are also computed out-of-fold."""
+        df_dict = {
+            "device": ["d1", "d1", "d2", "d2"],
+            "part": ["a", "a", "a", "a"],
+            "cost": ["lo", "lo", "hi", "hi"],
+        }
+        df = dataframe_init_dispatch(dataframe_dict=df_dict, library=library)
+
+        transformer = MeanResponseTransformer(
+            columns="part",
+            level="all",
+            group_column="device",
+            n_splits=2,
+        )
+        output = nw.from_native(transformer.fit_transform(df, df["cost"]))
+
+        # d1 is encoded from d2 only (all "hi") and d2 from d1 only (all "lo")
+        assert output.get_column("part_lo").to_list() == [0.0, 0.0, 1.0, 1.0]
+        assert output.get_column("part_hi").to_list() == [1.0, 1.0, 0.0, 0.0]
+
+    @pytest.mark.parametrize("library", ["pandas", "polars"])
+    def test_group_column_missing_errors(self, library):
+        """Test that a missing group_column raises an error."""
+        df = create_grouped_test_df(library=library)
+
+        transformer = MeanResponseTransformer(
+            columns="part", group_column="missing", n_splits=4
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=r"group_column \(missing\) is not present in columns of data",
+        ):
+            transformer.fit_transform(df, df["cost"])
+
+    @pytest.mark.parametrize("library", ["pandas", "polars"])
+    def test_single_group_errors(self, library):
+        """Test that fewer than two groups raises an error."""
+        df_dict = {
+            "device": ["d1", "d1", "d1", "d1"],
+            "part": ["a", "b", "a", "b"],
+            "cost": [1.0, 2.0, 3.0, 4.0],
+        }
+        df = dataframe_init_dispatch(dataframe_dict=df_dict, library=library)
+
+        transformer = MeanResponseTransformer(
+            columns="part", group_column="device", n_splits=4
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=r"out-of-fold encoding requires at least 2 distinct groups",
+        ):
+            transformer.fit_transform(df, df["cost"])
+
+    @pytest.mark.parametrize("library", ["pandas", "polars"])
+    def test_null_groups_error(self, library):
+        """Test that null group values raise an error."""
+        df_dict = {
+            "device": ["d1", None, "d2", "d2"],
+            "part": ["a", "b", "a", "b"],
+            "cost": [1.0, 2.0, 3.0, 4.0],
+        }
+        df = dataframe_init_dispatch(dataframe_dict=df_dict, library=library)
+
+        transformer = MeanResponseTransformer(
+            columns="part", group_column="device", n_splits=2
+        )
+
+        with pytest.raises(ValueError, match=r"contains null values"):
+            transformer.fit_transform(df, df["cost"])
+
+    def test_nan_groups_error(self):
+        """Test that pandas NaN group values are also treated as nulls."""
+        df = pd.DataFrame(
+            {
+                "device": ["d1", np.nan, "d2", "d2"],
+                "part": ["a", "b", "a", "b"],
+                "cost": [1.0, 2.0, 3.0, 4.0],
+            },
+        )
+
+        transformer = MeanResponseTransformer(
+            columns="part", group_column="device", n_splits=2
+        )
+
+        with pytest.raises(ValueError, match=r"contains null values \(1 nulls\)"):
+            transformer.fit_transform(df, df["cost"])
+
+    @pytest.mark.parametrize("library", ["pandas", "polars"])
+    def test_n_splits_capped_at_number_of_groups(self, library):
+        """Test n_splits above the group count is capped rather than erroring."""
+        df = create_grouped_test_df(library=library)
+
+        transformer = MeanResponseTransformer(
+            columns="part", group_column="device", n_splits=100
+        )
+
+        output = transformer.fit_transform(df, df["cost"])
+
+        assert len(output) == len(df)
+
+    @pytest.mark.parametrize("library", ["pandas", "polars"])
+    def test_without_group_column_matches_fit_transform(self, library):
+        """Test that without group_column, fit_transform is fit followed by transform."""
+        df = create_grouped_test_df(library=library)
+
+        transformer = MeanResponseTransformer(columns="part")
+        output = transformer.fit_transform(df, df["cost"])
+
+        expected = (
+            MeanResponseTransformer(columns="part").fit(df, df["cost"]).transform(df)
+        )
+
+        assert_frame_equal_dispatch(output, expected)
+
+    @pytest.mark.parametrize("library", ["pandas", "polars"])
+    def test_sklearn_pipeline_uses_full_mappings_on_new_data(self, library):
+        """Test that a fitted Pipeline transforms new data using full-data mappings."""
+        train_df = create_grouped_test_df(library=library)
+        new_df_dict = {
+            "device": ["new1", "new1"],
+            "part": ["a", "b"],
+            "cost": [9.0, 9.0],
+        }
+        new_df = dataframe_init_dispatch(dataframe_dict=new_df_dict, library=library)
+
+        transformer = MeanResponseTransformer(
+            columns="part", group_column="device", n_splits=4
+        )
+        pipeline = Pipeline([("encoder", transformer)])
+        pipeline.fit(train_df, train_df["cost"])
+
+        output = nw.from_native(pipeline.transform(new_df))
+
+        full_mappings = (
+            MeanResponseTransformer(columns="part")
+            .fit(train_df, train_df["cost"])
+            .mappings["part"]
+        )
+
+        assert output.get_column("part").to_list() == [
+            full_mappings["a"],
+            full_mappings["b"],
+        ]
+
+    @pytest.mark.parametrize("library", ["pandas", "polars"])
+    def test_sklearn_pipeline_trains_on_out_of_fold_encodings(self, library):
+        """Test Pipeline.fit routes training data through the out-of-fold fit_transform."""
+        df_dict = {
+            "device": ["d1", "d1", "d2", "d2"],
+            "part": ["a", "a", "a", "a"],
+            "cost": [1.0, 1.0, 10.0, 10.0],
+        }
+        df = dataframe_init_dispatch(dataframe_dict=df_dict, library=library)
+
+        transformer = MeanResponseTransformer(
+            columns="part", group_column="device", n_splits=2
+        )
+        # a pipeline with this encoder as an intermediate step uses fit_transform
+        pipeline = Pipeline(
+            [
+                ("encoder", transformer),
+                ("passthrough", "passthrough"),
+            ]
+        )
+        output = nw.from_native(
+            pipeline.fit_transform(df[["device", "part"]], df["cost"])
+        )
+
+        expected = MeanResponseTransformer(
+            columns="part", group_column="device", n_splits=2
+        ).fit_transform(df[["device", "part"]], df["cost"])
+
+        assert output.get_column("part").to_list() == (
+            nw.from_native(expected).get_column("part").to_list()
+        )
+        assert output.get_column("part").to_list() == [10.0, 10.0, 1.0, 1.0]
+
+    @pytest.mark.parametrize("library", ["pandas", "polars"])
+    def test_lazy_input_is_collected(self, library):
+        """Test that lazy inputs are accepted and the result matches the eager path."""
+        df = create_grouped_test_df(library=library)
+        if library != "polars":
+            pytest.skip("lazyframes are polars only")
+
+        transformer = MeanResponseTransformer(
+            columns="part", group_column="device", n_splits=4
+        )
+        lazy_output = transformer.fit_transform(df.lazy(), df["cost"])
+
+        eager_transformer = MeanResponseTransformer(
+            columns="part", group_column="device", n_splits=4
+        )
+        eager_output = eager_transformer.fit_transform(df, df["cost"])
+
+        assert_frame_equal_dispatch(lazy_output, eager_output)

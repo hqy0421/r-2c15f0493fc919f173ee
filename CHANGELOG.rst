@@ -31,6 +31,7 @@ Each individual change should have a link to the pull request after the descript
 -------------------
 Changed
 ^^^^^^^
+- feat: MeanResponseTransformer supports grouped out-of-fold encoding during training via new ``group_column`` and ``n_splits`` arguments. When ``group_column`` is set, ``fit_transform`` holds whole groups out together so each training row is encoded using mappings learnt from other folds only, while ``fit``/``transform`` keep full-data mappings for new tables.
 - chore: switched codespaces and github actions to use pyproject.toml for env, removed req.text file
 - feat: added min/max version testing in github actions
 - chore: removed cap on polars version
